@@ -367,18 +367,188 @@ inline static winding_t* ClipToSeperators(
 }
 
 // =====================================================================================
+//  TargetChecks
+//      Filter mightsee by clipping against all portals
+// =====================================================================================
+static unsigned TargetChecks(const pstack_t* const head, const pstack_t* const prevstack)
+{
+	unsigned i, numChecks=0;
+	portal_t* p;
+	pstack_s stack;
+
+	if (!prevstack->pass)
+		return 0;
+
+	for (i = 0; i < g_bitlongs; i++)
+		((long*)stack.mightsee)[i] = 0;
+
+    stack.clipPlaneCount = -1;
+
+	// check against all portals
+	for (i = 0, p = g_portals; i < g_numportals * 2; i++, p++)
+	{
+		const unsigned offset = p->leaf >> 3;
+		const unsigned bit = 1 << (p->leaf & 7);
+
+		if ((stack.mightsee[offset] & bit))
+		{
+			continue;
+		}
+
+		if (!(prevstack->mightsee[offset] & bit))
+		{
+			continue;
+		}
+
+		numChecks++;
+
+        // get plane of portal, point normal into the neighbor leaf
+        stack.portalplane = &p->plane;
+        plane_t             backplane;
+        VectorSubtract(vec3_origin, p->plane.normal, backplane.normal);
+        backplane.dist = -p->plane.dist;
+
+        if (VectorCompare(prevstack->portalplane->normal, backplane.normal))
+        {
+            continue;                                      // can't go out a coplanar face
+        }
+
+        stack.portal = p;
+        stack.freewindings[0] = 1;
+        stack.freewindings[1] = 1;
+        stack.freewindings[2] = 1;
+
+		stack.pass = ChopWinding(p->winding, &stack, head->portalplane);
+		if (!stack.pass)
+		{
+			continue;
+		}
+
+		stack.source = ChopWinding(prevstack->source, &stack, &backplane);
+		if (!stack.source)
+		{
+			continue;
+		}
+
+		stack.pass = ChopWinding(stack.pass, &stack, prevstack->portalplane);
+		if (!stack.pass)
+		{
+			continue;
+		}
+
+#ifdef RVIS_LEVEL_2
+		if (stack.clipPlaneCount == -1)
+		{
+			stack.clipPlaneCount = 0;
+			stack.clipPlane = (plane_t*)alloca(sizeof(plane_t) * prevstack->source->numpoints * prevstack->pass->numpoints);
+
+			ClipToSeperators(prevstack->source, prevstack->pass, NULL, false, &stack);
+			ClipToSeperators(prevstack->pass, prevstack->source, NULL, true, &stack);
+		}
+
+		if (stack.clipPlaneCount > 0)
+		{
+			unsigned j;
+			for (j = 0; j < stack.clipPlaneCount && stack.pass != NULL; j++)
+			{
+				stack.pass = ChopWinding(stack.pass, &stack, &(stack.clipPlane[j]));
+			}
+
+			if (stack.pass == NULL)
+			continue;
+		}
+#else
+
+		stack.pass = ClipToSeperators(stack.source, prevstack->pass, stack.pass, false, &stack);
+		if (!stack.pass)
+		{
+			continue;
+		}
+
+		stack.pass = ClipToSeperators(prevstack->pass, stack.source, stack.pass, true, &stack);
+		if (!stack.pass)
+		{
+			continue;
+		}
+#endif
+
+		stack.mightsee[offset] |= bit;
+	}
+
+	for (i = 0; i < g_bitlongs; i++)
+	{
+		((long*)prevstack->mightsee)[i] &= ((long*)stack.mightsee)[i];
+	}
+
+	return numChecks;
+}
+
+// =====================================================================================
+//  IterativeTargetChecks
+//      Retrace the path and reduce mightsee by clipping the targets directly
+// =====================================================================================
+static unsigned IterativeTargetChecks(pstack_t* const head)
+{
+    unsigned numChecks = 0;
+
+    for (pstack_t* stack = head; stack; stack = stack->next)
+    {
+        if (stack->didTargetChecks)
+            continue;
+
+        numChecks += TargetChecks(head, stack);
+
+        if (stack->next)
+        {
+            pstack_t* next = stack->next;
+            for (int i = 0; i < g_bitlongs; i++)
+                ((long*)next->mightsee)[i] &= ((long*)stack->mightsee)[i];
+        }
+
+        // mark done
+        stack->didTargetChecks = true;
+        stack->numExpectedTargetsChecks = 0;
+    }
+
+	return numChecks;
+}
+
+// =====================================================================================
+// PopCnt
+//     Return number of set bits
+// =====================================================================================
+inline static unsigned PopCnt(unsigned long v)
+{
+#if defined __has_builtin
+#if __has_builtin (__builtin_popcount)
+	return __builtin_popcount(v);
+#else
+	for (unsigned c = 0; v; c++)
+		v &= v - 1;
+
+	return c;
+#endif
+#else
+	for (unsigned c = 0; v; c++)
+		v &= v - 1;
+
+	return c;
+#endif
+}
+
+// =====================================================================================
 //  RecursiveLeafFlow
 //      Flood fill through the leafs
 //      If src_portal is NULL, this is the originating leaf
 // =====================================================================================
-inline static void     RecursiveLeafFlow(const int leafnum, const threaddata_t* const thread, const pstack_t* const prevstack)
+inline static void     RecursiveLeafFlow(const int leafnum, threaddata_t* const thread, pstack_t* const prevstack)
 {
     pstack_t        stack;
     leaf_t*         leaf;
 
     leaf = &g_leafs[leafnum];
 #ifdef USE_CHECK_STACK
-    CheckStack(leaf, thread);
+    // CheckStack(leaf, thread);
 #endif
 
     {
@@ -391,6 +561,13 @@ inline static void     RecursiveLeafFlow(const int leafnum, const threaddata_t* 
             thread->leafvis[offset] |= bit;
             thread->base->numcansee++;
         }
+    }
+
+    if (prevstack->numExpectedTargetsChecks > 0 &&
+        thread->numSteps >= thread->numTargetChecks + prevstack->numExpectedTargetsChecks)
+    {
+        unsigned numActualTargetChecks = IterativeTargetChecks(&thread->pstack_head);
+        thread->numTargetChecks += numActualTargetChecks;
     }
 
 #ifdef USE_CHECK_STACK
@@ -406,7 +583,7 @@ inline static void     RecursiveLeafFlow(const int leafnum, const threaddata_t* 
 #endif
 
     // check all portals for flowing into other leafs       
-    unsigned i;
+    unsigned i, nummightsee;
     portal_t** plist = leaf->portals;
 
     for (i = 0; i < leaf->numportals; i++, plist++)
@@ -456,10 +633,15 @@ inline static void     RecursiveLeafFlow(const int leafnum, const threaddata_t* 
                     long* might = (long*)stack.mightsee;
                 
                     unsigned j;
+                    nummightsee = 0;
                     for (j = 0; j < bitlongs; j++, test++, might++, prevmight++)
                     {
-                        (*might) = (*prevmight) & (*test);
+                        long mightlong = (*prevmight) & (*test);
+                        *might = mightlong;
+                        nummightsee += PopCnt(mightlong);
                     }
+                    stack.didTargetChecks = false;
+                    stack.numExpectedTargetsChecks = prevstack->numExpectedTargetsChecks + nummightsee;
                 }
         
                 {
@@ -481,6 +663,8 @@ inline static void     RecursiveLeafFlow(const int leafnum, const threaddata_t* 
                 }
             }
         }
+
+        thread->numSteps++;
 
         // get plane of portal, point normal into the neighbor leaf
         stack.portalplane = &p->plane;
@@ -615,6 +799,8 @@ void            PortalFlow(portal_t* p)
     {
         ((long*)data.pstack_head.mightsee)[i] = ((long*)p->mightsee)[i];
     }
+    data.numSteps = 0;
+    data.numTargetChecks = 0;
     RecursiveLeafFlow(p->leaf, &data, &data.pstack_head);
 
 #ifdef ZHLT_NETVIS

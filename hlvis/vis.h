@@ -47,7 +47,7 @@
 
 #define	MAX_PORTALS	32768
 
-//#define USE_CHECK_STACK
+#define USE_CHECK_STACK
 #define RVIS_LEVEL_1
 #define RVIS_LEVEL_2
 
@@ -127,6 +127,8 @@ typedef struct pstack_s
 
     winding_t       windings[3];                           // source, pass, temp in any order
     char            freewindings[3];
+    char            didTargetChecks;
+    unsigned        numExpectedTargetsChecks;
 
     const plane_t*  portalplane;
 
@@ -142,6 +144,8 @@ typedef struct
     //      byte            fullportal[MAX_PORTALS/8];              // bit string
     portal_t*       base;
     pstack_t        pstack_head;
+    unsigned        numSteps;
+    unsigned        numTargetChecks;
 } threaddata_t;
 
 #ifdef HLVIS_MAXDIST
